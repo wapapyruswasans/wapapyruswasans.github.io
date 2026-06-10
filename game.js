@@ -142,7 +142,7 @@ function spawnZombie() {
     
     const waveBonusHp = (currentWave - 1) * 20;
     const baseHp = 150 + waveBonusHp;
-    const waveBonusSpeed = (currentWave - 1) * 0.1;
+    const waveBonusSpeed = (currentWave - 1) * 0.02;
 
     zombies.push({
         x: canvas.width,
@@ -152,7 +152,7 @@ function spawnZombie() {
         height: 190, 
         hp: baseHp,     
         maxHp: baseHp,
-        speed: 0.5 + Math.min(waveBonusSpeed, 0.5)
+        speed: 0.2 + Math.min(waveBonusSpeed, 0.2)
     });
 }
 
