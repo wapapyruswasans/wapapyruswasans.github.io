@@ -16,8 +16,8 @@ const ROW_OFFSET_FACTOR = 0.95;
 let isGameOver = false;
 let currentWave = 1;
 let waveTimer = 0;
-const WAVE_DURATION = 1800; 
-let zombieSpawnInterval = 5000; 
+const WAVE_DURATION = 3600;
+let zombieSpawnInterval = 10000; 
 let lastZombieSpawnTime = 0;
 
 // 게임 객체 저장소
@@ -281,7 +281,7 @@ function update() {
     if (waveTimer >= WAVE_DURATION) {
         currentWave++;
         waveTimer = 0;
-        zombieSpawnInterval = Math.max(1500, 5000 - (currentWave * 500));
+        zombieSpawnInterval = Math.max(1500, 10000 - (currentWave * 50));
     }
 
     if (now - lastZombieSpawnTime > zombieSpawnInterval) {
