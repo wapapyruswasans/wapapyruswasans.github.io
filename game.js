@@ -152,7 +152,7 @@ function spawnZombie() {
         height: 190, 
         hp: baseHp,     
         maxHp: baseHp,
-        speed: 0.2 + Math.min(waveBonusSpeed, 0.2)
+        speed: 0.1 + Math.min(waveBonusSpeed, 0.1)
     });
 }
 
