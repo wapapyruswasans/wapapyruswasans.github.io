@@ -140,9 +140,9 @@ function spawnZombie() {
     const randomRow = Math.floor(Math.random() * GRID_ROWS);
     const yPos = gridStartY + (randomRow * cellHeight * ROW_OFFSET_FACTOR) + (cellHeight / 2) - 135; 
     
-    const waveBonusHp = (currentWave - 1) * 20;
+    const waveBonusHp = (currentWave - 1) * 100;
     const baseHp = 150 + waveBonusHp;
-    const waveBonusSpeed = (currentWave - 1) * 0.02;
+    const waveBonusSpeed = (currentWave - 1) * 0.1;
 
     zombies.push({
         x: canvas.width,
