@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>RGB&lt;150 + 베지어 브릿지 + FFT 에피사이클 (속도 조절)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0a0a; color: #ddd; font-family: -apple-system, sans-serif; overflow: hidden; height: 100vh; }
+  .container { display: flex; flex-direction: column; height: 100vh; }
+  .toolbar { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: #111; border-bottom: 1px solid #222; flex-wrap: wrap; }
+  .toolbar button { background: #222; color: #ddd; border: 1px solid #333; padding: 5px 12px; cursor: pointer; border-radius: 4px; font-size: 13px; }
+  .toolbar button:hover { background: #333; }
+  .toolbar input[type=file] { background: #222; color: #ddd; border: 1px solid #333; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+  .toolbar input[type=range] { width: 200px; accent-color: #ff8833; }
+  .toolbar input[type=number] { width: 70px; background: #222; color: #ddd; border: 1px solid #333; padding: 3px 6px; border-radius: 3px; font-size: 12px; }
+  #nLabel, #speedLabel { display: inline-block; min-width: 36px; color: #ffaa55; font-family: monospace; font-size: 14px; }
+  #statusLabel { margin-left: auto; color: #777; font-size: 12px; font-family: monospace; }
+  .main { display: flex; flex: 1; overflow: hidden; }
+  .left { width: 40%; display: flex; flex-direction: column; padding: 8px; gap: 8px; }
+  .right { flex: 1; display: flex; flex-direction: column; padding: 8px; gap: 8px; }
+  .panel { background: #111; border: 1px solid #222; border-radius: 4px; position: relative; overflow: hidden; }
+  .panel-label { position: absolute; top: 6px; left: 10px; color: #888; font-size: 11px; z-index: 10; pointer-events: none; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .left .panel { flex: 1; min-height: 0; }
+  .right .panel:first-child { flex: 2; min-height: 0; }
+  .right .panel:last-child { flex: 1; min-height: 0; }
+  .error-label { position: absolute; top: 10px; right: 10px; background: rgba(30,30,30,0.9); padding: 10px 14px; border-radius: 8px; font-family: 'Consolas', monospace; font-size: 14px; z-index: 10; text-align: right; pointer-events: none; min-width: 200px; }
+  .error-label .rmse { color: #ff5500; font-weight: bold; font-size: 18px; }
+  .error-label .mse { color: #aaa; font-size: 14px; margin-top: 4px; }
+  .legend { position: absolute; bottom: 8px; left: 10px; color: #aaa; font-size: 11px; z-index: 10; }
+  .legend .o { color: #ff8800; font-weight: bold; }
+  .legend .g { color: #00ff00; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="toolbar">
+    <input type="file" id="fileInput" accept="image/*">
+    <button id="playBtn">재생 / 일시정지</button>
+    <label style="display:flex;align-items:center;gap:8px;color:#aaa;font-size:13px;">
+      n: <input type="range" id="nSlider" min="1" max="500" value="30">
+      <span id="nLabel">30</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;color:#aaa;font-size:13px;">
+      속도: <input type="range" id="speedSlider" min="0.1" max="5" step="0.1" value="1">
+      <span id="speedLabel">1.0x</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:6px;color:#aaa;font-size:12px;">
+      임계값: <input type="number" id="threshInput" value="150" min="10" max="255">
+    </label>
+    <span id="statusLabel">이미지를 불러오세요</span>
+  </div>
+  <div class="main">
+    <div class="left">
+      <div class="panel">
+        <div class="panel-label">원본 이미지</div>
+        <canvas id="imgCanvas"></canvas>
+      </div>
+      <div class="panel">
+        <div class="panel-label">덩어리별 닫힘 + 베지어 연결</div>
+        <canvas id="contourCanvas"></canvas>
+        <div class="legend">
+          <span class="o">■</span> 외곽선 &nbsp;
+          <span class="g">■</span> 베지어 브릿지
+        </div>
+      </div>
+    </div>
+    <div class="right">
+      <div class="panel">
+        <div class="panel-label">푸리에 애니메이션</div>
+        <div class="error-label" id="errorLabel">
+          <div class="rmse">RMSE: --</div>
+          <div class="mse">MSE: --</div>
+        </div>
+        <canvas id="fourierCanvas"></canvas>
+      </div>
+      <div class="panel">
+        <div class="panel-label">X 파동 (노랑) / Y 파동 (초록)</div>
+        <canvas id="waveCanvas"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+/* ============================================================
+   전역 상태
+   ============================================================ */
+const S = {
+  rawX: null, rawY: null, penStates: null,
+  fullXComps: [], fullYComps: [],
+  xComps: [], yComps: [],
+  reconX: [], reconY: [],
+  nTerms: 30, animT: 0, animRunning: false,
+  speed: 1.0,  // ★ 재생 속도 배율
+  imgEl: null,
+};
+
+const imgCanvas = document.getElementById('imgCanvas');
+const contourCanvas = document.getElementById('contourCanvas');
+const fourierCanvas = document.getElementById('fourierCanvas');
+const waveCanvas = document.getElementById('waveCanvas');
+const errorLabel = document.getElementById('errorLabel');
+const statusLabel = document.getElementById('statusLabel');
+const nSlider = document.getElementById('nSlider');
+const nLabel = document.getElementById('nLabel');
+const speedSlider = document.getElementById('speedSlider');
+const speedLabel = document.getElementById('speedLabel');
+const threshInput = document.getElementById('threshInput');
+const ctxImg = imgCanvas.getContext('2d');
+const ctxContour = contourCanvas.getContext('2d');
+const ctxFourier = fourierCanvas.getContext('2d');
+const ctxWave = waveCanvas.getContext('2d');
+
+function fitCanvas(canvas, ctx) {
+  const r = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width));
+  const h = Math.max(1, Math.round(r.height));
+  if (canvas.width !== Math.round(w*dpr) || canvas.height !== Math.round(h*dpr)) {
+    canvas.width = Math.round(w*dpr); canvas.height = Math.round(h*dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w, h };
+}
+function fitAll() {
+  fitCanvas(imgCanvas, ctxImg); fitCanvas(contourCanvas, ctxContour);
+  fitCanvas(fourierCanvas, ctxFourier); fitCanvas(waveCanvas, ctxWave);
+}
+window.addEventListener('resize', () => {
+  fitAll(); drawImage(); drawContour(); drawFourier(); drawWave();
+});
+
+function sqTf(w, h, half) {
+  const s = Math.min(w, h) / (2 * half);
+  return { s, ox: w/2, oy: h/2,
+    px(x, y) { return [this.ox + x*this.s, this.oy - y*this.s]; } };
+}
+function waveTf(w, h, N) {
+  const xs = w / Math.max(1, N-1), ys = (h/2)/500;
+  return { xs, ys, mid: h/2, px(i, v) { return [i*this.xs, this.mid - v*this.ys]; } };
+}
+
+/* ============================================================
+   1. 마스크 + 윤곽선 추출
+   ============================================================ */
+function makeMask(imageData, threshold) {
+  const W = imageData.width, H = imageData.height;
+  const data = imageData.data;
+  const mask = new Uint8Array(W * H);
+  for (let i = 0, p = 0; i < W*H; i++, p += 4) {
+    mask[i] = (data[p] < threshold && data[p+1] < threshold && data[p+2] < threshold) ? 1 : 0;
+  }
+  return mask;
+}
+
+function extractAllContours(mask, W, H) {
+  const contours = [];
+  const visitedFg = new Uint8Array(W * H);
+  const visitedBg = new Uint8Array(W * H);
+
+  // (A) 검정 픽셀 외곽선
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y*W + x;
+      if (mask[idx] === 1 && !visitedFg[idx]) {
+        const c = traceContour(mask, W, H, x, y, false);
+        if (c.length > 2) contours.push(c);
+        const stack = [idx];
+        visitedFg[idx] = 1;
+        while (stack.length) {
+          const cur = stack.pop();
+          const cy = (cur/W)|0, cx = cur - cy*W;
+          if (cx > 0 && mask[cur-1] === 1 && !visitedFg[cur-1]) { visitedFg[cur-1] = 1; stack.push(cur-1); }
+          if (cx < W-1 && mask[cur+1] === 1 && !visitedFg[cur+1]) { visitedFg[cur+1] = 1; stack.push(cur+1); }
+          if (cy > 0 && mask[cur-W] === 1 && !visitedFg[cur-W]) { visitedFg[cur-W] = 1; stack.push(cur-W); }
+          if (cy < H-1 && mask[cur+W] === 1 && !visitedFg[cur+W]) { visitedFg[cur+W] = 1; stack.push(cur+W); }
+        }
+      }
+    }
+  }
+
+  // (B) 내부 구멍
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const idx = y*W + x;
+      if (mask[idx] === 0 && !visitedBg[idx]) {
+        let touchesBorder = false, foundBoundary = false;
+        let startX = x, startY = y;
+        const stack = [idx];
+        visitedBg[idx] = 1;
+        while (stack.length) {
+          const cur = stack.pop();
+          const cy = (cur/W)|0, cx = cur - cy*W;
+          if (cx === 0 || cy === 0 || cx === W-1 || cy === H-1) touchesBorder = true;
+          if (cy < startY || (cy === startY && cx < startX)) { startX = cx; startY = cy; }
+          if (!foundBoundary) {
+            if ((cx > 0 && mask[cur-1] === 1) || (cx < W-1 && mask[cur+1] === 1) ||
+                (cy > 0 && mask[cur-W] === 1) || (cy < H-1 && mask[cur+W] === 1)) foundBoundary = true;
+          }
+          if (cx > 0 && mask[cur-1] === 0 && !visitedBg[cur-1]) { visitedBg[cur-1] = 1; stack.push(cur-1); }
+          if (cx < W-1 && mask[cur+1] === 0 && !visitedBg[cur+1]) { visitedBg[cur+1] = 1; stack.push(cur+1); }
+          if (cy > 0 && mask[cur-W] === 0 && !visitedBg[cur-W]) { visitedBg[cur-W] = 1; stack.push(cur-W); }
+          if (cy < H-1 && mask[cur+W] === 0 && !visitedBg[cur+W]) { visitedBg[cur+W] = 1; stack.push(cur+W); }
+        }
+        if (!touchesBorder && foundBoundary) {
+          const c = traceContour(mask, W, H, startX, startY, true);
+          if (c.length > 2) contours.push(c);
+        }
+      }
+    }
+  }
+  return contours;
+}
+
+function traceContour(mask, W, H, startX, startY, isHole) {
+  const DX = [1,1,0,-1,-1,-1,0,1];
+  const DY = [0,1,1,1,0,-1,-1,-1];
+  const target = isHole ? 0 : 1;
+  const get = (x, y) => (x>=0 && y>=0 && x<W && y<H) ? mask[y*W+x] : (isHole ? 1 : 0);
+  const contour = [];
+  let cx = startX, cy = startY, dir = 7, startVisits = 0, safety = 0;
+  const MAX = W*H*8;
+  while (safety++ < MAX) {
+    contour.push([cx, cy]);
+    let found = false;
+    for (let k = 0; k < 8; k++) {
+      const nd = (dir + k) % 8;
+      const nx = cx + DX[nd], ny = cy + DY[nd];
+      if (get(nx, ny) === target) {
+        dir = (nd + 6) % 8;
+        cx = nx; cy = ny;
+        found = true;
+        if (cx === startX && cy === startY) {
+          startVisits++;
+          if (startVisits >= 2) return contour;
+        }
+        break;
+      }
+    }
+    if (!found) break;
+  }
+  return contour;
+}
+
+/* ============================================================
+   2. 하나의 연속 경로로 (원본 Python과 동일)
+   ============================================================ */
+function buildSingleStroke(contours, W, H, targetTotalSamples, bridgeRatio) {
+  const paths = [];
+  for (const c of contours) {
+    if (c.length < 3) continue;
+    const p = c.map(pt => [pt[0], pt[1]]);
+    if (p[0][0] !== p[p.length-1][0] || p[0][1] !== p[p.length-1][1]) {
+      p.push([p[0][0], p[0][1]]);
+    }
+    paths.push(p);
+  }
+  if (paths.length === 0) throw new Error('유효한 윤곽선이 없습니다.');
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of paths) for (const [x, y] of p) {
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+  }
+  const xc = (minX+maxX)/2, yc = (minY+maxY)/2;
+  let half = Math.max(maxX-minX, maxY-minY)/2;
+  if (half === 0) half = 1;
+  const scale = 300/half;
+
+  const normPaths = paths.map(p => p.map(([x, y]) => [(x-xc)*scale, -(y-yc)*scale]));
+
+  const lens = normPaths.map(p => {
+    let L = 0;
+    for (let i = 1; i < p.length; i++) L += Math.hypot(p[i][0]-p[i-1][0], p[i][1]-p[i-1][1]);
+    return L;
+  });
+  const totalLen = lens.reduce((a, b) => a+b, 0);
+
+  const MIN = 30;
+  const counts = lens.map(L => Math.max(MIN, Math.floor(targetTotalSamples * (L/totalLen) * (1 - bridgeRatio))));
+  const resampled = [];
+  for (let i = 0; i < normPaths.length; i++) {
+    const p = normPaths[i];
+    const n = Math.max(2, counts[i]);
+    const dists = [0];
+    for (let j = 1; j < p.length; j++) dists.push(dists[j-1] + Math.hypot(p[j][0]-p[j-1][0], p[j][1]-p[j-1][1]));
+    const tot = dists[dists.length-1];
+    if (tot === 0) continue;
+    const rx = new Array(n), ry = new Array(n);
+    let j = 0;
+    for (let k = 0; k < n; k++) {
+      const t = k * tot / (n-1);
+      while (j < dists.length-2 && dists[j+1] < t) j++;
+      const segLen = dists[j+1]-dists[j];
+      const u = segLen > 0 ? (t-dists[j])/segLen : 0;
+      rx[k] = p[j][0] + u*(p[j+1][0]-p[j][0]);
+      ry[k] = p[j][1] + u*(p[j+1][1]-p[j][1]);
+    }
+    rx[n-1] = rx[0]; ry[n-1] = ry[0];
+    resampled.push({ x: rx, y: ry, N: n, length: tot });
+  }
+  resampled.sort((a, b) => b.length - a.length);
+  if (resampled.length === 0) throw new Error('리샘플 결과 없음');
+
+  function createBridge(pA, pB, n) {
+    const midX = (pA[0]+pB[0])/2, midY = (pA[1]+pB[1])/2;
+    const dX = pB[0]-pA[0], dY = pB[1]-pA[1];
+    let px = -dY, py = dX;
+    const pl = Math.hypot(px, py);
+    if (pl > 1e-6) { px /= pl; py /= pl; }
+    const dLen = Math.hypot(dX, dY);
+    const cD = Math.min(60, dLen * 0.4);
+    const cX = midX + px*cD, cY = midY + py*cD;
+    const bx = new Array(n), by = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const t = n === 1 ? 0 : i/(n-1), mt = 1-t;
+      bx[i] = mt*mt*pA[0] + 2*mt*t*cX + t*t*pB[0];
+      by[i] = mt*mt*pA[1] + 2*mt*t*cY + t*t*pB[1];
+    }
+    const dd = [0];
+    for (let i = 1; i < n; i++) dd.push(dd[i-1] + Math.hypot(bx[i]-bx[i-1], by[i]-by[i-1]));
+    const tot = dd[dd.length-1];
+    if (tot === 0) return { x: bx, y: by };
+    const rx = new Array(n), ry = new Array(n);
+    let j = 0;
+    for (let k = 0; k < n; k++) {
+      const t = k * tot / (n-1);
+      while (j < dd.length-2 && dd[j+1] < t) j++;
+      const segLen = dd[j+1]-dd[j];
+      const u = segLen > 0 ? (t-dd[j])/segLen : 0;
+      rx[k] = bx[j] + u*(bx[j+1]-bx[j]);
+      ry[k] = by[j] + u*(by[j+1]-by[j]);
+    }
+    return { x: rx, y: ry };
+  }
+
+  const fullX = [], fullY = [], pen = [];
+
+  const s0 = resampled[0];
+  for (let i = 0; i < s0.N; i++) { fullX.push(s0.x[i]); fullY.push(s0.y[i]); pen.push(1); }
+  let curEnd = [s0.x[s0.N-1], s0.y[s0.N-1]];
+  const used = new Array(resampled.length).fill(false);
+  used[0] = true;
+
+  const bpc = d => Math.max(20, Math.floor(d*2));
+
+  while (used.some(u => !u)) {
+    let bestI = -1, bestD = Infinity, rev = false;
+    for (let i = 0; i < resampled.length; i++) {
+      if (used[i]) continue;
+      const s = resampled[i];
+      const dS = Math.hypot(s.x[0]-curEnd[0], s.y[0]-curEnd[1]);
+      const dE = Math.hypot(s.x[s.N-1]-curEnd[0], s.y[s.N-1]-curEnd[1]);
+      if (dS < bestD) { bestD = dS; bestI = i; rev = false; }
+      if (dE < bestD) { bestD = dE; bestI = i; rev = true; }
+    }
+    if (bestI === -1) break;
+    const s = resampled[bestI];
+    let rx = s.x.slice(), ry = s.y.slice();
+    if (rev) {
+      rx.reverse(); ry.reverse();
+      rx[rx.length-1] = rx[0]; ry[ry.length-1] = ry[0];
+    }
+    used[bestI] = true;
+
+    const bN = bpc(bestD);
+    const bg = createBridge(curEnd, [rx[0], ry[0]], bN);
+    for (let i = 0; i < bN-1; i++) { fullX.push(bg.x[i]); fullY.push(bg.y[i]); pen.push(0); }
+    for (let i = 0; i < rx.length; i++) { fullX.push(rx[i]); fullY.push(ry[i]); pen.push(1); }
+    curEnd = [rx[rx.length-1], ry[ry.length-1]];
+  }
+
+  const closeD = Math.hypot(fullX[fullX.length-1]-fullX[0], fullY[fullY.length-1]-fullY[0]);
+  const cN = bpc(closeD);
+  const cb = createBridge([fullX[fullX.length-1], fullY[fullY.length-1]], [fullX[0], fullY[0]], cN);
+  for (let i = 0; i < cN-1; i++) { fullX.push(cb.x[i]); fullY.push(cb.y[i]); pen.push(0); }
+
+  const cum = [0];
+  for (let i = 1; i < fullX.length; i++) cum.push(cum[i-1] + Math.hypot(fullX[i]-fullX[i-1], fullY[i]-fullY[i-1]));
+  const totalArc = cum[cum.length-1];
+
+  const outX = new Array(targetTotalSamples);
+  const outY = new Array(targetTotalSamples);
+  const outPen = new Array(targetTotalSamples);
+
+  let si = 0, ii = 0;
+  for (let k = 0; k < targetTotalSamples; k++) {
+    const t = k * totalArc / (targetTotalSamples - 1);
+    while (si < cum.length && cum[si] < t) si++;
+    outPen[k] = pen[Math.min(si, pen.length-1)];
+    while (ii < cum.length-2 && cum[ii+1] < t) ii++;
+    const segLen = cum[ii+1]-cum[ii];
+    const u = segLen > 0 ? (t-cum[ii])/segLen : 0;
+    outX[k] = fullX[ii] + u*(fullX[ii+1]-fullX[ii]);
+    outY[k] = fullY[ii] + u*(fullY[ii+1]-fullY[ii]);
+  }
+  outX[targetTotalSamples-1] = outX[0];
+  outY[targetTotalSamples-1] = outY[0];
+
+  let i = 0;
+  while (i < outPen.length) {
+    if (outPen[i] === 1) {
+      const start = i;
+      while (i < outPen.length && outPen[i] === 1) i++;
+      const end = i-1;
+      if (start < end) { outX[end] = outX[start]; outY[end] = outY[start]; }
+    } else i++;
+  }
+  return { x: outX, y: outY, penStates: outPen };
+}
+
+/* ============================================================
+   3. FFT
+   ============================================================ */
+function get1DComps(signal, nTerms) {
+  const N = signal.length;
+  nTerms = Math.floor(nTerms);
+  const maxK = Math.min(nTerms, Math.floor(N/2));
+  const comps = [];
+  let dc = 0;
+  for (let i = 0; i < N; i++) dc += signal[i];
+  comps.push({ amp: dc/N, phase: 0, freq: 0 });
+  for (let k = 1; k <= maxK; k++) {
+    let re = 0, im = 0;
+    const step = -2*Math.PI*k/N;
+    for (let n = 0; n < N; n++) {
+      const a = step*n;
+      re += signal[n]*Math.cos(a);
+      im += signal[n]*Math.sin(a);
+    }
+    re = (re/N)*2; im = (im/N)*2;
+    comps.push({ amp: Math.hypot(re, im), phase: Math.atan2(im, re), freq: k });
+  }
+  return comps;
+}
+function get1DVal(comps, t) {
+  let v = 0;
+  for (const c of comps) {
+    if (c.freq === 0) v += c.amp;
+    else v += c.amp * Math.cos(c.freq * t + c.phase);
+  }
+  return v;
+}
+function getChain(comps, t) {
+  let cx = 0, cy = 0;
+  const chain = [{ x: 0, y: 0 }];
+  const circles = [];
+  for (const c of comps) {
+    if (c.freq === 0) { cx += c.amp; chain.push({ x: cx, y: cy }); continue; }
+    const a = c.freq * t + c.phase;
+    circles.push({ x: cx, y: cy, r: c.amp });
+    const nx = cx + c.amp * Math.cos(a);
+    const ny = cy + c.amp * Math.sin(a);
+    chain.push({ x: nx, y: ny });
+    cx = nx; cy = ny;
+  }
+  return { chain, circles, endX: cx, endY: cy };
+}
+function precomputeCurves(xc, yc, N) {
+  const rx = new Array(N), ry = new Array(N);
+  for (let i = 0; i < N; i++) {
+    const t = 2*Math.PI*i/N;
+    rx[i] = get1DVal(xc, t);
+    ry[i] = get1DVal(yc, t);
+  }
+  return { rx, ry };
+}
+
+/* ============================================================
+   4. 오차
+   ============================================================ */
+function computeError() {
+  if (!S.rawX) return;
+  const N = S.rawX.length;
+  let sumSq = 0, cnt = 0;
+  for (let i = 0; i < N; i++) {
+    if (S.penStates[i] === 1) {
+      const dx = S.rawX[i] - S.reconX[i];
+      const dy = S.rawY[i] - S.reconY[i];
+      sumSq += dx*dx + dy*dy;
+      cnt++;
+    }
+  }
+  const mse = cnt > 0 ? sumSq/cnt : 0;
+  const rmse = Math.sqrt(mse);
+  let maxR = 0;
+  for (let i = 0; i < N; i++) {
+    const r = Math.hypot(S.rawX[i], S.rawY[i]);
+    if (r > maxR) maxR = r;
+  }
+  if (maxR === 0) maxR = 1;
+  const pct = (rmse/maxR)*100;
+  errorLabel.innerHTML =
+    `<div class="rmse">RMSE: ${pct.toFixed(3)}%</div>` +
+    `<div class="mse">MSE: ${mse.toFixed(2)}</div>`;
+}
+
+/* ============================================================
+   그리기
+   ============================================================ */
+function drawImage() {
+  const { w, h } = fitCanvas(imgCanvas, ctxImg);
+  ctxImg.clearRect(0, 0, w, h);
+  if (!S.imgEl) return;
+  const img = S.imgEl;
+  const sc = Math.min(w/img.naturalWidth, h/img.naturalHeight);
+  const dw = img.naturalWidth*sc, dh = img.naturalHeight*sc;
+  ctxImg.drawImage(img, (w-dw)/2, (h-dh)/2, dw, dh);
+}
+
+function drawContour() {
+  const { w, h } = fitCanvas(contourCanvas, ctxContour);
+  ctxContour.clearRect(0, 0, w, h);
+  if (!S.rawX) return;
+  const tf = sqTf(w, h, 350);
+  ctxContour.lineJoin = 'round';
+  ctxContour.lineCap = 'round';
+  ctxContour.lineWidth = 1.5;
+
+  const N = S.rawX.length;
+  let i = 0;
+  while (i < N) {
+    const st = S.penStates[i];
+    const start = i;
+    while (i < N && S.penStates[i] === st) i++;
+    const end = i;
+    ctxContour.strokeStyle = st === 1 ? '#ff8800' : '#00ff00';
+    ctxContour.beginPath();
+    for (let k = start; k < end; k++) {
+      const [px, py] = tf.px(S.rawX[k], S.rawY[k]);
+      if (k === start) ctxContour.moveTo(px, py);
+      else ctxContour.lineTo(px, py);
+    }
+    ctxContour.stroke();
+  }
+}
+
+function drawFourier() {
+  const { w, h } = fitCanvas(fourierCanvas, ctxFourier);
+  ctxFourier.clearRect(0, 0, w, h);
+  if (!S.reconX.length) return;
+
+  const tf = sqTf(w, h, 500);
+  const t = S.animT;
+  const N = S.reconX.length;
+  const tIdx = Math.min(N-1, Math.floor((t/(2*Math.PI))*N));
+
+  ctxFourier.lineWidth = 2;
+  ctxFourier.lineJoin = 'round';
+  ctxFourier.lineCap = 'round';
+  let i = 0;
+  while (i < N) {
+    const st = S.penStates[i];
+    const start = i;
+    while (i < N && S.penStates[i] === st) i++;
+    const end = i;
+    if (st !== 1) continue;
+    if (tIdx < start) continue;
+    const stop = Math.min(tIdx, end);
+    ctxFourier.strokeStyle = 'rgba(255,120,50,0.9)';
+    ctxFourier.beginPath();
+    for (let k = start; k <= stop; k++) {
+      const [px, py] = tf.px(S.reconX[k], S.reconY[k]);
+      if (k === start) ctxFourier.moveTo(px, py);
+      else ctxFourier.lineTo(px, py);
+    }
+    ctxFourier.stroke();
+  }
+
+  const xOffX = -380, xOffY = 0, yOffX = 0, yOffY = -380;
+
+  const xCh = getChain(S.xComps, t);
+  ctxFourier.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctxFourier.lineWidth = 1;
+  ctxFourier.beginPath();
+  for (let i = 0; i < xCh.chain.length; i++) {
+    const p = xCh.chain[i];
+    const [px, py] = tf.px(p.x + xOffX, p.y + xOffY);
+    if (i === 0) ctxFourier.moveTo(px, py);
+    else ctxFourier.lineTo(px, py);
+  }
+  ctxFourier.stroke();
+
+  ctxFourier.strokeStyle = 'rgba(255,210,60,0.4)';
+  for (const c of xCh.circles.slice().sort((a,b) => b.r - a.r).slice(0, 50)) {
+    if (c.r < 0.5) continue;
+    const [px, py] = tf.px(c.x + xOffX, c.y + xOffY);
+    ctxFourier.beginPath();
+    ctxFourier.arc(px, py, c.r*tf.s, 0, 2*Math.PI);
+    ctxFourier.stroke();
+  }
+
+  const yCh = getChain(S.yComps, t);
+  ctxFourier.strokeStyle = 'rgba(255,255,255,0.35)';
+  ctxFourier.lineWidth = 1;
+  ctxFourier.beginPath();
+  for (let i = 0; i < yCh.chain.length; i++) {
+    const p = yCh.chain[i];
+    const [px, py] = tf.px(p.x + yOffX, p.y + yOffY);
+    if (i === 0) ctxFourier.moveTo(px, py);
+    else ctxFourier.lineTo(px, py);
+  }
+  ctxFourier.stroke();
+
+  ctxFourier.strokeStyle = 'rgba(90,255,120,0.4)';
+  for (const c of yCh.circles.slice().sort((a,b) => b.r - a.r).slice(0, 50)) {
+    if (c.r < 0.5) continue;
+    const [px, py] = tf.px(c.x + yOffX, c.y + yOffY);
+    ctxFourier.beginPath();
+    ctxFourier.arc(px, py, c.r*tf.s, 0, 2*Math.PI);
+    ctxFourier.stroke();
+  }
+
+  const xVal = get1DVal(S.xComps, t);
+  const yVal = get1DVal(S.yComps, t);
+  const [mx, my] = tf.px(xVal, yVal);
+
+  ctxFourier.strokeStyle = 'rgba(255,210,60,0.5)';
+  ctxFourier.setLineDash([4,4]);
+  const [gx] = tf.px(xCh.endX + xOffX, 0);
+  ctxFourier.beginPath();
+  ctxFourier.moveTo(gx, my); ctxFourier.lineTo(mx, my);
+  ctxFourier.stroke();
+
+  ctxFourier.strokeStyle = 'rgba(90,255,120,0.5)';
+  const [, gy] = tf.px(0, yCh.endY + yOffY);
+  ctxFourier.beginPath();
+  ctxFourier.moveTo(mx, gy); ctxFourier.lineTo(mx, my);
+  ctxFourier.stroke();
+  ctxFourier.setLineDash([]);
+
+  ctxFourier.fillStyle = '#fff';
+  ctxFourier.strokeStyle = '#000';
+  ctxFourier.lineWidth = 1;
+  ctxFourier.beginPath();
+  ctxFourier.arc(mx, my, 5, 0, 2*Math.PI);
+  ctxFourier.fill();
+  ctxFourier.stroke();
+}
+
+function drawWave() {
+  const { w, h } = fitCanvas(waveCanvas, ctxWave);
+  ctxWave.clearRect(0, 0, w, h);
+  if (!S.reconX.length) return;
+
+  const N = S.reconX.length;
+  const tf = waveTf(w, h, N);
+  const tIdx = Math.min(N-1, Math.floor((S.animT/(2*Math.PI))*N));
+
+  ctxWave.strokeStyle = 'rgba(255,255,255,0.08)';
+  ctxWave.lineWidth = 1;
+  ctxWave.beginPath();
+  ctxWave.moveTo(0, tf.mid); ctxWave.lineTo(w, tf.mid);
+  ctxWave.stroke();
+
+  ctxWave.strokeStyle = '#ffd23c';
+  ctxWave.lineWidth = 2;
+  ctxWave.beginPath();
+  for (let i = 0; i <= tIdx; i++) {
+    const [px, py] = tf.px(i, S.reconX[i]);
+    if (i === 0) ctxWave.moveTo(px, py); else ctxWave.lineTo(px, py);
+  }
+  ctxWave.stroke();
+
+  ctxWave.strokeStyle = '#5aff78';
+  ctxWave.beginPath();
+  for (let i = 0; i <= tIdx; i++) {
+    const [px, py] = tf.px(i, S.reconY[i]);
+    if (i === 0) ctxWave.moveTo(px, py); else ctxWave.lineTo(px, py);
+  }
+  ctxWave.stroke();
+
+  if (tIdx > 0) {
+    const [px] = tf.px(tIdx, 0);
+    ctxWave.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctxWave.setLineDash([3,5]);
+    ctxWave.beginPath();
+    ctxWave.moveTo(px, 0); ctxWave.lineTo(px, h);
+    ctxWave.stroke();
+    ctxWave.setLineDash([]);
+  }
+}
+
+/* ============================================================
+   애니메이션 루프 (속도 반영)
+   ============================================================ */
+function animate() {
+  if (S.animRunning && S.reconX.length) {
+    // ★ 속도 배율 적용
+    S.animT += 0.02 * S.speed;
+    if (S.animT > 2*Math.PI) S.animT = 0;
+    drawFourier();
+    drawWave();
+  }
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+/* ============================================================
+   재계산
+   ============================================================ */
+let pendingN = null, rafSched = false;
+function scheduleRecompute(n) {
+  pendingN = n;
+  if (rafSched) return;
+  rafSched = true;
+  requestAnimationFrame(() => {
+    rafSched = false;
+    if (pendingN !== null) { recompute(pendingN); pendingN = null; }
+  });
+}
+function recompute(n) {
+  if (!S.rawX) return;
+  S.nTerms = n;
+  nLabel.textContent = String(n);
+  const N = S.rawX.length;
+  const maxK = Math.min(n, Math.floor(N/2));
+  S.xComps = S.fullXComps.slice(0, maxK+1);
+  S.yComps = S.fullYComps.slice(0, maxK+1);
+  const { rx, ry } = precomputeCurves(S.xComps, S.yComps, N);
+  S.reconX = rx; S.reconY = ry;
+  computeError();
+  S.animT = 0;
+  S.animRunning = true;
+  drawContour();
+}
+
+/* ============================================================
+   파일 로드 & 파이프라인
+   ============================================================ */
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  const img = new Image();
+  img.onload = () => {
+    URL.revokeObjectURL(url);
+    S.imgEl = img;
+    fitAll(); drawImage();
+    requestAnimationFrame(() => processImage(img));
+  };
+  img.onerror = () => { statusLabel.textContent = '이미지 로드 실패'; };
+  img.src = url;
+});
+
+function processImage(img) {
+  statusLabel.textContent = '처리중...';
+  try {
+    const maxSize = 800;
+    const sc = Math.min(1, maxSize / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * sc));
+    const h = Math.max(1, Math.round(img.naturalHeight * sc));
+    const tmp = document.createElement('canvas');
+    tmp.width = w; tmp.height = h;
+    const tctx = tmp.getContext('2d', { willReadFrequently: true });
+    tctx.drawImage(img, 0, 0, w, h);
+    const id = tctx.getImageData(0, 0, w, h);
+
+    const thresh = parseInt(threshInput.value, 10) || 150;
+
+    const mask = makeMask(id, thresh);
+    const contours = extractAllContours(mask, w, h);
+    if (contours.length === 0) throw new Error('윤곽선을 찾지 못했습니다.');
+
+    const result = buildSingleStroke(contours, w, h, 2000, 0.1);
+    S.rawX = result.x;
+    S.rawY = result.y;
+    S.penStates = result.penStates;
+
+    const N = result.x.length;
+    statusLabel.textContent = 'FFT 계산중...';
+    requestAnimationFrame(() => {
+      const maxKFull = Math.min(500, Math.floor(N/2));
+      S.fullXComps = get1DComps(S.rawX, maxKFull);
+      S.fullYComps = get1DComps(S.rawY, maxKFull);
+
+      const n = Math.min(S.nTerms, maxKFull);
+      S.xComps = S.fullXComps.slice(0, n+1);
+      S.yComps = S.fullYComps.slice(0, n+1);
+
+      const { rx, ry } = precomputeCurves(S.xComps, S.yComps, N);
+      S.reconX = rx; S.reconY = ry;
+      computeError();
+
+      S.animT = 0;
+      S.animRunning = true;
+      statusLabel.textContent = `완료 | 윤곽선 ${contours.length}개 | ${N} 샘플`;
+      drawContour();
+      drawFourier();
+      drawWave();
+    });
+  } catch (err) {
+    console.error(err);
+    statusLabel.textContent = '오류: ' + err.message;
+  }
+}
+
+/* ============================================================
+   UI 이벤트
+   ============================================================ */
+document.getElementById('playBtn').addEventListener('click', () => {
+  S.animRunning = !S.animRunning;
+});
+nSlider.addEventListener('input', (e) => {
+  const v = parseInt(e.target.value, 10);
+  nLabel.textContent = String(v);
+  scheduleRecompute(v);
+});
+// ★ 속도 슬라이더
+speedSlider.addEventListener('input', (e) => {
+  S.speed = parseFloat(e.target.value);
+  speedLabel.textContent = S.speed.toFixed(1) + 'x';
+});
+threshInput.addEventListener('change', () => {
+  if (S.imgEl) processImage(S.imgEl);
+});
+</script>
+</body>
+</html>
